@@ -1,85 +1,151 @@
 # leave-it-on-me
 
-A short-link service that fits in a single `main.py`. No dependencies, no
-framework, no build step — just the Python standard library and SQLite.
+A short-link **resolver** that fits in a single `main.py`. Paste a short link,
+get the main link back.
 
 ```
-https://your-host/repo   →   https://github.com/you/a/really/long/path
+https://bit.ly/3xyzAb   →   https://example.com/the/real/page?with=params
 ```
+
+No dependencies, no framework, no browser. It's the Python standard library
+walking the redirect chain and reading what the page tells it — including pages
+that only ever hand the destination to JavaScript.
 
 ## Run it
 
 ```bash
-python main.py                              # http://0.0.0.0:8000, db=./links.db
-python main.py --port 9000 --db /data/links.db
-PORT=9000 python main.py                    # env vars: HOST, PORT, DB_PATH
-python main.py --rate-limit 0               # disable the create-rate cap
+python main.py https://bit.ly/3xyzAb          # resolve one link
+python main.py bit.ly/3xyzAb --json           # machine-readable
+python main.py bit.ly/3xyzAb --no-color       # plain text
+python main.py --serve                        # web UI on :8000
+python main.py --serve --demo                 # ...with offline demo links
 ```
 
-Then open <http://localhost:8000> for the dashboard: paste a URL, optionally
-pick a slug and an expiry, and you get a copy-ready short link plus a table of
-everything you've shortened with click counts.
+The web UI is a paste-and-go page: it shows the final URL, the whole hop-by-hop
+chain, why each hop was taken, a "clean" URL with tracking parameters stripped,
+and warnings about where it's about to send you.
 
-Requires Python 3.9+. The database is created on first run and is the only state
-the app has.
+## How it finds the destination
+
+Redirects it follows itself:
+
+| Signal | Example |
+| --- | --- |
+| HTTP `Location` | `301/302/303/307/308` — followed hop by hop, up to `--max-hops` |
+| `Refresh` header | `Refresh: 0; url=/next` |
+| `<meta http-equiv="refresh">` | `content="3; url=https://…"`, either attribute order |
+
+Then, if the page is a gate that never redirects, it reads the destination out
+of the page statically (no JavaScript is executed):
+
+| Signal | Example it catches |
+| --- | --- |
+| `location.href` / `replace` / `assign` | `window.location.href="https://…"`, `top.location='…'` |
+| URL parameters | `/go?url=`, `?r=`, `?target=`, `?redirect_uri=`, … |
+| `data-*` attributes | `<div data-url="https://…">` |
+| embedded JSON | `{"target": "https://…"}` in a config blob |
+| base64 payloads | `?r=aHR0cHM6Ly9leGFtcGxlLmNvbQ` |
+| "continue" links | `<a href="https://…">Continue to the download</a>` |
+
+Anything weaker than that — a bare link in the page with neutral text — is
+*listed as a guess* rather than silently followed, so you can see the
+candidates without the tool guessing wrong. `--no-guess` disables even the
+confident "continue" clicks, leaving only explicit, machine-readable hops.
+
+Some things it deliberately will not do: a link **gate** (linkvertise,
+shrinkme, gplinks and friends) hands its destination to JavaScript after an ad
+or a captcha, and sometimes only after a server round-trip tied to your session.
+There is nothing static to read, so the tool says exactly that instead of
+pretending to bypass it. Faking a browser to defeat an ad gate isn't something
+this does.
+
+## Output
+
+```
+$ python main.py https://bit.ly/3xyzAb
+link  https://bit.ly/3xyzAb
+  1. 301  bit.ly                 → redirect  https://example.com/l/9f2 (48 ms)
+  2. 200  example.com            final page  (112 ms)
+
+main link  https://example.com/l/9f2?utm_source=newsletter
+clean url  https://example.com/l/9f2
+page       Example — the real page
+found via  301 redirect
+verdict    resolved  (171 ms)
+note       Resolved after 1 step.
+
+  ! .zip is a TLD with a lot of abuse
+```
+
+Verdicts: `resolved`, `already_main` (the link doesn't redirect anywhere),
+`gateway` (a monetised gate), `loop` (the chain eats itself) and `error`.
+Exit codes: `0` resolved, `1` error, `2` loop or gateway.
+
+Every destination is also checked for things worth knowing before you click:
+plain `http`, bare IP hosts, punycode look-alikes, `@`-obfuscated URLs,
+non-standard ports, abuse-heavy TLDs, long chains, and links that end in an
+executable or archive (`.exe`, `.apk`, `.zip`, …).
 
 ## HTTP API
 
 | Method | Path | What it does |
 | --- | --- | --- |
-| `POST` | `/api/links` | create a link → `201` + the link as JSON |
-| `GET` | `/api/links` | list recent links |
-| `GET` | `/api/links/<code>` | one link (any casing: `/api/links/Repo` finds `repo`) |
-| `DELETE` | `/api/links/<code>` | delete a link |
-| `GET` | `/<code>` | `302` redirect to the target; `404` unknown, `410` expired |
-| `GET` | `/healthz` | liveness + link count |
+| `POST` | `/api/resolve` | `{"url": "https://bit.ly/x"}` → the full result as JSON |
+| `GET` | `/api/resolve?url=…` | same thing, handy for `curl` |
+| `GET` | `/healthz` | liveness |
 
 ```bash
-curl -X POST localhost:8000/api/links \
-     -H 'content-type: application/json' \
-     -d '{"url": "example.com/some/long/path", "slug": "docs", "expires_in": 86400}'
+curl -s 'localhost:8000/api/resolve?url=https://bit.ly/3xyzAb' | jq .final_url
 ```
 
 ```json
 {
-  "code": "docs",
-  "short_url": "http://localhost:8000/docs",
-  "target": "https://example.com/some/long/path",
-  "clicks": 0,
-  "created_at": "2026-10-06T18:13:33Z",
-  "expires_at": "2026-10-07T18:13:33Z",
-  "expired": false
+  "input_url": "https://bit.ly/3xyzAb",
+  "final_url": "https://example.com/the/real/page",
+  "clean_url": "https://example.com/the/real/page",
+  "verdict": "resolved",
+  "via": ["301 redirect", "meta refresh"],
+  "hops": [{"url": "…", "status": 301, "note": "→ redirect", "elapsed_ms": 48}],
+  "candidates": [{"url": "…", "source": "link in the page", "score": 4}],
+  "flags": [], "title": "…", "note": "Resolved after 2 steps.", "elapsed_ms": 171
 }
 ```
 
-`expires_in` is a number of seconds from now (omit it, or pass `0`, for a link
-that never expires). Both fields are optional; `slug` defaults to a random
-6-character code from an alphabet with no look-alike characters
-(`23456789abcdefghjkmnpqrstuvwxyz`).
+## Options worth knowing
 
-Errors come back as `{"error": "..."}` with a useful status: `400` bad input,
-`409` slug taken, `429` rate limited. Unknown slugs render a themed 404 page
-instead of redirecting anywhere.
+| Flag | Why |
+| --- | --- |
+| `--max-hops N` | give up after N hops (default 12) |
+| `--timeout S` / `--budget S` | per request / whole chain (default 12s / 45s) |
+| `--insecure` | skip TLS verification, for a site with a broken certificate |
+| `--allow-private` | allow localhost/LAN targets; off by default |
+| `--no-guess` | only follow explicit, machine-readable destinations |
+| `--rate-limit N` | with `--serve`: resolutions per IP per 10 min (default 60) |
 
-## Notes on behaviour
+## Notes
 
-- **Input is normalised and checked.** `example.com/x` becomes
-  `https://example.com/x`; only `http`/`https` targets are accepted, so
-  `javascript:`, `data:` and header-injection payloads are rejected. Everything
-  rendered into HTML is escaped, and non-ASCII targets are percent-encoded in
-  the `Location` header.
-- **Clicks** are counted on real `GET` requests; `HEAD` probes and browsers
-  prefetching don't inflate the number.
-- **Expired links** stay listed on the dashboard with an `expired` badge and
-  return `410 Gone`.
-- **Slugs** are unique case-insensitively and may not collide with app routes
-  (`/api`, `/healthz`, …).
-- **Rate limit** defaults to 60 new links per 10 minutes per IP; it's in memory,
-  so it resets on restart and is per-process.
-- **Reverse proxies**: the app honours `X-Forwarded-Host` and
-  `X-Forwarded-Proto` when building the short URL it shows you, so behind
-  nginx/Caddy the links you copy are the public ones. Only trust those headers
-  if something in front of the app sets them.
-- **Scaling**: SQLite in WAL mode with one connection per request and a write
-  lock, which happily handles a small personal instance. For real traffic, put
-  it behind a proxy and swap `Store` for Postgres — the HTTP layer doesn't care.
+- **SSRF guard.** `http://127.0.0.1:…`, `10.x`, `192.168.x`, `169.254.x` and
+  friends are refused by default, so a hosted instance can't be used to poke at
+  the network behind it. A link that points at *this* server is fetched over
+  loopback while still being displayed as the public URL, so a preview or proxy
+  hostname resolves fine.
+- **No JavaScript is executed** and no page scripts are trusted: destinations
+  are read as text and validated (`http`/`https` only, no control characters),
+  and `javascript:`, `data:` and `file:` values are dropped.
+- **Tracking parameters** (`utm_*`, `fbclid`, `gclid`, `si`, `ttclid`, …) are
+  stripped only in the `clean_url` field — `final_url` stays byte-for-byte what
+  the chain produced.
+- **HTML is generated from untrusted strings** (page titles, URLs, hostnames)
+  and is escaped before it reaches the DOM; the UI builds nodes via
+  `textContent`-style escaping, not raw `innerHTML`.
+- Not included on purpose: paywall/article extraction, captcha solving, and
+  anything that needs a real browser engine. If you need a browser, drive a
+  headless one — this tool stays a plain HTTP client.
+
+## Tests
+
+45 offline tests, no network needed:
+
+```bash
+python -m unittest -v test_main
+```
