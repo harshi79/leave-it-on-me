@@ -62,6 +62,11 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# leave-it-on-me link database
+links.db
+links.db-wal
+links.db-shm
+
 # Flask stuff:
 instance/
 .webassets-cache
